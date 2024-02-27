@@ -22,6 +22,8 @@ type Container struct {
 	db           *sql.DB
 	isTemplate   bool
 	ccfg         *pgx.ConnConfig
+	pool         *dockertest.Pool
+	resource     *dockertest.Resource
 
 	mu     sync.Mutex
 	closed bool
@@ -97,11 +99,12 @@ func Start(tb testing.TB, options ...startConfigFunc) *Container {
 		ccfg:         nil,
 	}
 
-	pool, err := dockertest.NewPool("")
+	var err error
+	c.pool, err = dockertest.NewPool("")
 	if err != nil {
 		tb.Fatalf("unable to connect to Docker: %v", err)
 	}
-	if err = pool.Client.Ping(); err != nil {
+	if err = c.pool.Client.Ping(); err != nil {
 		tb.Fatalf(`could not connect to docker: %v`, err)
 	}
 
@@ -115,7 +118,7 @@ func Start(tb testing.TB, options ...startConfigFunc) *Container {
 		env = append(env, "PGDATA=/data")
 	}
 
-	resource, err := pool.RunWithOptions(&dockertest.RunOptions{
+	c.resource, err = c.pool.RunWithOptions(&dockertest.RunOptions{
 		Name:       fmt.Sprintf("%s_%09d", c.databaseName, time.Now().UnixNano()),
 		Repository: "postgres",
 		Tag:        "16-alpine",
@@ -134,19 +137,16 @@ func Start(tb testing.TB, options ...startConfigFunc) *Container {
 		tb.Fatalf("unable to start PostgreSQL container: %v", err)
 	}
 	tb.Cleanup(func() {
-		err = pool.Purge(resource)
-		if err != nil {
-			tb.Fatalf("could not purge containers: %v", err)
-		}
+		c.Close()
 	})
 
 	// Tell docker to hard kill the container in "timeout" seconds
-	if err := resource.Expire(uint(timeout.Seconds())); err != nil {
+	if err := c.resource.Expire(uint(timeout.Seconds())); err != nil {
 		tb.Fatal(err)
 	}
-	pool.MaxWait = timeout
+	c.pool.MaxWait = timeout
 
-	c.hostPort = resource.GetHostPort("5432/tcp")
+	c.hostPort = c.resource.GetHostPort("5432/tcp")
 
 	c.dsn = fmt.Sprintf("postgres://postgres:postgres@%s/%s?sslmode=disable", c.hostPort, c.databaseName)
 	c.ccfg, err = pgx.ParseConfig(c.dsn)
@@ -155,8 +155,8 @@ func Start(tb testing.TB, options ...startConfigFunc) *Container {
 	}
 
 	// Configure logging from Docker container
-	logWaiter, err := pool.Client.AttachToContainerNonBlocking(docker.AttachToContainerOptions{
-		Container: resource.Container.ID,
+	logWaiter, err := c.pool.Client.AttachToContainerNonBlocking(docker.AttachToContainerOptions{
+		Container: c.resource.Container.ID,
 		// OutputStream: os.Stdout,
 		// ErrorStream:  os.Stderr,
 		// Stderr:       true,
@@ -180,7 +180,7 @@ func Start(tb testing.TB, options ...startConfigFunc) *Container {
 	})
 
 	// Connect to PostgreSQL container
-	err = pool.Retry(func() (err error) {
+	err = c.pool.Retry(func() (err error) {
 		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 		defer cancel()
 		c.db, err = Connect(ctx, c.dsn)
@@ -218,7 +218,6 @@ func (c *Container) Close() error {
 	if c.closed {
 		return nil
 	}
-	c.closed = true
 
 	if c.isTemplate {
 		sql := fmt.Sprintf(`UPDATE pg_database SET datistemplate = FALSE WHERE datname = '%s'`,
@@ -228,6 +227,14 @@ func (c *Container) Close() error {
 			return fmt.Errorf("could not make database a template: %w", err)
 		}
 	}
+
+	err := c.pool.Purge(c.resource)
+	if err != nil {
+		return fmt.Errorf("could not purge containers: %w", err)
+	}
+
+	c.closed = true
+
 	return c.db.Close()
 }
 
